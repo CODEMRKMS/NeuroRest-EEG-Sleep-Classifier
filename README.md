@@ -1,4 +1,4 @@
-# Automatic-Sleep-Stage-Classification-using-EEG-Data
+# NeuroRest-EEG-Sleep-Classifier
 
 Authors: Shadab, Aryan, Adina
 
