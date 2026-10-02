@@ -262,4 +262,6 @@ CNN_model.summary()
 ```
 Again multiple layers were tested and these lines have been left in the code. The final results from the optimized model can be found in Figure 3. 
 
+Further testing has been planned for the near future.
+
 ![Figure 3:1D CNN Optimized Results](https://github.com/Newber0/Automatic-Sleep-Stage-Classification-using-EEG-Data/blob/main/Image-Results/Optimized%201D%20CNN.PNG)
