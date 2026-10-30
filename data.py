@@ -1,93 +1,211 @@
 # Authors: Shadab, Aryan, Adina
 
-import glob
 import os
+import re
+import shutil
+import time
+import urllib.request
+from pathlib import Path
 
 import numpy as np
 import pyedflib
 import tensorflow as tf
-from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import to_categorical
 
+import config
 
-def prepare_datasets(path='/content/Samples'):
-    # Getting all files together, separating hypnogram and PSG files, and re-ordering them.
-    c = glob.glob(os.path.join(path, '*Hypnogram.edf'))
-    d = glob.glob(os.path.join(path, '*PSG.edf'))
-    len_annot = len(glob.glob(os.path.join(path, '*Hypnogram.edf')))
-    len_signal = len(glob.glob(os.path.join(path, '*PSG.edf')))
-    c.sort()
-    d.sort()
+# Hypnogram description -> class index (S1=0 ... REM=4). Wake, '?' and Movement time
+# are dropped, so only the 5 sleep classes remain.
+STAGE_TO_CLASS = {
+    'Sleep stage 1': 0,
+    'Sleep stage 2': 1,
+    'Sleep stage 3': 2,
+    'Sleep stage 4': 3,
+    'Sleep stage R': 4,
+}
+DROPPED_STAGES = {'Sleep stage W', 'Sleep stage ?', 'Movement time'}
 
-    X_data_total = np.zeros((0, 3000, 2))
-    Y_data_total = np.zeros(0)
 
-    for i in range(0, len_annot):
-        f = pyedflib.EdfReader(d[i])
-        g = pyedflib.EdfReader(c[i])
-        n = f.signals_in_file
+# ---------------------------------------------------------------- download
 
-        sigbufs = np.zeros((n - 5, f.getNSamples()[0]))
-        for i in np.arange(n - 5):
-            sigbufs[i, :] = f.readSignal(i)
+def download_sleep_edf(data_dir, num_subjects=config.NUM_SUBJECTS, base_url=config.BASE_URL):
+    """Download PSG + Hypnogram pairs for the first `num_subjects` subjects (both nights)."""
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
 
-        annots = g.readAnnotations()
-        annots_norm = np.empty((len(annots) - 1, len(annots[0])))
-        annots_norm[0:2, :] = np.asarray(annots[0:2], dtype=np.int64)
-        annots_str = np.asarray(annots[2])
+    with urllib.request.urlopen(base_url, timeout=60) as response:
+        html = response.read().decode('utf-8')
+    names = sorted(set(re.findall(r'href="(SC4\d{3}[A-Z0-9]{2}-(?:PSG|Hypnogram)\.edf)"', html)))
 
-        annots_norm[0, :] = annots_norm[0, :] / 30
-        annots_norm[1, :] = annots_norm[1, :] / 30
+    subjects = sorted({name[3:5] for name in names})[:num_subjects]
+    names = [name for name in names if name[3:5] in subjects]
+    print(f'Downloading {len(names)} files for {len(subjects)} subjects to {data_dir}')
 
-        annots_strtoclass_1 = np.char.replace(annots_str, ['Sleep stage W'], ['0'])
-        annots_strtoclass_2 = np.char.replace(annots_strtoclass_1, ['Sleep stage 1'], ['1'])
-        annots_strtoclass_3 = np.char.replace(annots_strtoclass_2, ['Sleep stage 2'], ['2'])
-        annots_strtoclass_4 = np.char.replace(annots_strtoclass_3, ['Sleep stage 3'], ['3'])
-        annots_strtoclass_5 = np.char.replace(annots_strtoclass_4, ['Sleep stage 4'], ['4'])
-        annots_strtoclass_6 = np.char.replace(annots_strtoclass_5, ['Sleep stage R'], ['5'])
-        annots_strtoclass_7 = np.char.replace(annots_strtoclass_6, ['Sleep stage ?'], ['6'])
-        annots_strtoclass_8 = np.char.replace(annots_strtoclass_7, ['Movement time'], ['7'])
-        annots_strtoclass = annots_strtoclass_8.astype(np.int64)
+    for n, name in enumerate(names, 1):
+        target = data_dir / name
+        if target.exists():
+            continue
+        print(f'[{n}/{len(names)}] {name}')
+        _download_file(base_url + name, target)
 
-        count = 0
-        k = 0
-        X_data = np.zeros(shape=(int(sigbufs[0].size / 3000), 3000, 2))
-        Y_data = np.zeros(int(sigbufs[0].size / 3000))
 
-        for i in range(annots_norm[0].size - 1):
-            for j in range(int(annots_norm[1, i])):
-                X_data[k, :, :] = np.transpose(sigbufs[:, count:count + 3000])
-                Y_data[k] = annots_strtoclass[i]
-                k = k + 1
-                count = count + 3000
-        X_data_total = np.append(X_data_total, X_data, axis=0)
-        Y_data_total = np.append(Y_data_total, Y_data)
+def _download_file(url, target, retries=3):
+    part = target.with_name(target.name + '.part')
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response, open(part, 'wb') as out:
+                shutil.copyfileobj(response, out, length=1 << 20)
+            os.replace(part, target)
+            return
+        except OSError as error:
+            if attempt == retries:
+                raise
+            print(f'  retry {attempt}/{retries - 1} after: {error}')
+            time.sleep(2 * attempt)
 
-    remove = np.where(Y_data_total == 7)
-    remove = np.array(remove)
-    X_data_total = np.delete(X_data_total, remove, axis=0)
-    Y_data_total = np.delete(Y_data_total, remove)
 
-    remove1 = np.where(Y_data_total == 0)
-    remove1 = np.array(remove1)
-    X_data_total = np.delete(X_data_total, remove1, axis=0)
-    Y_data_total = np.delete(Y_data_total, remove1)
+# ----------------------------------------------------------------- loading
 
-    sleep_set = X_data_total
-    y1 = to_categorical(Y_data_total)
-    y = y1[:, 1:6]
+def find_recordings(data_dir):
+    """Pair PSG and Hypnogram files by their recording id (e.g. SC4001)."""
+    data_dir = Path(data_dir)
+    psg = {p.name[:6]: p for p in data_dir.glob('*PSG.edf')}
+    hyp = {p.name[:6]: p for p in data_dir.glob('*Hypnogram.edf')}
+    unpaired = sorted(psg.keys() ^ hyp.keys())
+    if unpaired:
+        print(f'Warning: ignoring recordings without a PSG/Hypnogram pair: {unpaired}')
+    return [(key, psg[key], hyp[key]) for key in sorted(psg.keys() & hyp.keys())]
 
-    training_data, testing_data, training_labels, testing_labels = train_test_split(
-        sleep_set, y, test_size=0.2
-    )
 
-    dataset_train = tf.data.Dataset.from_tensor_slices((training_data, training_labels))
-    dataset_test = tf.data.Dataset.from_tensor_slices((testing_data, testing_labels))
+def read_recording(psg_path, hyp_path):
+    """Cut one night into 30 s epochs of shape (3000, 2) with sleep-stage labels 0-4."""
+    f = pyedflib.EdfReader(str(psg_path))
+    g = pyedflib.EdfReader(str(hyp_path))
+    try:
+        labels = f.getSignalLabels()
+        idx = [labels.index(channel) for channel in config.CHANNELS]  # Fpz-Cz, Pz-Oz
+        for i in idx:
+            if int(round(f.getSampleFrequency(i))) * config.EPOCH_SECONDS != config.SAMPLES_PER_EPOCH:
+                raise ValueError(f'{psg_path.name}: expected 100 Hz EEG')
+        sigbufs = np.stack([f.readSignal(i) for i in idx]).astype(np.float32)
+        onsets, durations, descriptions = g.readAnnotations()
+    finally:
+        f.close()
+        g.close()
 
-    BATCH_SIZE = 64
-    SHUFFLE_BUFFER_SIZE = 10000
+    n_samples = sigbufs.shape[1]
+    X, y = [], []
+    for onset, duration, description in zip(onsets, durations, descriptions):
+        if description in DROPPED_STAGES:
+            continue
+        if description not in STAGE_TO_CLASS:
+            raise ValueError(f'{hyp_path.name}: unknown annotation {description!r}')
+        start = int(round(float(onset) * 100))
+        for j in range(int(float(duration) // config.EPOCH_SECONDS)):
+            s = start + j * config.SAMPLES_PER_EPOCH
+            if s + config.SAMPLES_PER_EPOCH > n_samples:
+                break
+            X.append(np.transpose(sigbufs[:, s:s + config.SAMPLES_PER_EPOCH]))
+            y.append(STAGE_TO_CLASS[description])
 
-    dataset_train = dataset_train.shuffle(SHUFFLE_BUFFER_SIZE).batch(BATCH_SIZE)
-    dataset_test = dataset_test.batch(BATCH_SIZE)
+    return np.stack(X), np.array(y, dtype=np.int8)
 
-    return dataset_train, dataset_test
+
+def cache_recordings(data_dir):
+    """Return [(subject, cache_path)] per recording, reading EDFs only if there is no .npz cache."""
+    data_dir = Path(data_dir)
+    cache_dir = data_dir / 'cache'
+    cache_dir.mkdir(exist_ok=True)
+
+    cached = []
+    for key, psg_path, hyp_path in find_recordings(data_dir):
+        cache = cache_dir / f'{key}.npz'
+        if not cache.exists():
+            print(f'Processing {psg_path.name} -> {cache.name}')
+            X, y = read_recording(psg_path, hyp_path)
+            tmp = cache_dir / f'{key}.tmp.npz'
+            np.savez(tmp, X=X, y=y)
+            os.replace(tmp, cache)
+        cached.append((key[3:5], cache))
+    return cached
+
+
+# ------------------------------------------------------------------- split
+
+def split_subjects(subjects, seed=config.SEED,
+                   val_fraction=config.VAL_FRACTION, test_fraction=config.TEST_FRACTION):
+    """Shuffle the subject ids with a fixed seed and cut them into train/val/test."""
+    subjects = sorted(set(subjects))
+    n = len(subjects)
+    if n < 3:
+        raise ValueError(f'Need at least 3 subjects for a train/val/test split, found {n}')
+    n_test = max(1, round(n * test_fraction))
+    n_val = max(1, round(n * val_fraction))
+    order = np.random.RandomState(seed).permutation(n)
+    shuffled = [subjects[i] for i in order]
+    return (sorted(shuffled[n_test + n_val:]),
+            sorted(shuffled[n_test:n_test + n_val]),
+            sorted(shuffled[:n_test]))
+
+
+def print_split_summary(name, subjects, y):
+    counts = np.bincount(y, minlength=len(config.CLASS_NAMES))
+    print(f'{name}: {len(subjects)} subjects, {len(y)} epochs')
+    print(f'  subjects: {", ".join(subjects)}')
+    print('  classes:  ' + ', '.join(f'{c}={n}' for c, n in zip(config.CLASS_NAMES, counts)))
+
+
+# ---------------------------------------------------------------- datasets
+
+def load_splits(data_dir=config.DATA_DIR, num_subjects=config.NUM_SUBJECTS, download=False,
+                with_test_x=True):
+    """Subject-wise split as {'train'|'val'|'test': {'subjects', 'X', 'y'}}; y holds class ids 0-4.
+
+    With with_test_x=False the test signals are never read from the cache (X is None),
+    only its labels.
+    """
+    data_dir = Path(data_dir)
+
+    if download or not find_recordings(data_dir):
+        download_sleep_edf(data_dir, num_subjects)
+    cached = cache_recordings(data_dir)
+    if not cached:
+        raise FileNotFoundError(f'No PSG/Hypnogram EDF pairs found in {data_dir}')
+
+    train_ids, val_ids, test_ids = split_subjects([subject for subject, _ in cached])
+
+    splits = {}
+    for name, ids in (('train', train_ids), ('val', val_ids), ('test', test_ids)):
+        Xs, ys = [], []
+        for subject, path in cached:
+            if subject not in ids:
+                continue
+            with np.load(path) as npz:  # .npz members are read lazily
+                ys.append(npz['y'])
+                if name != 'test' or with_test_x:
+                    Xs.append(npz['X'])
+        splits[name] = {'subjects': ids,
+                        'X': np.concatenate(Xs) if Xs else None,
+                        'y': np.concatenate(ys)}
+    return splits
+
+
+def prepare_datasets(data_dir=config.DATA_DIR, num_subjects=config.NUM_SUBJECTS, download=False):
+    splits = load_splits(data_dir, num_subjects, download)
+
+    datasets = []
+    for name in ('train', 'val', 'test'):
+        split = splits[name]
+        print_split_summary(name, split['subjects'], split['y'])
+        datasets.append((split['X'], to_categorical(split['y'], num_classes=len(config.CLASS_NAMES))))
+
+    (X_train, y_train), (X_val, y_val), (X_test, y_test) = datasets
+    dataset_train = tf.data.Dataset.from_tensor_slices((X_train, y_train))
+    dataset_val = tf.data.Dataset.from_tensor_slices((X_val, y_val))
+    dataset_test = tf.data.Dataset.from_tensor_slices((X_test, y_test))
+
+    dataset_train = dataset_train.shuffle(config.SHUFFLE_BUFFER_SIZE).batch(config.BATCH_SIZE)
+    dataset_val = dataset_val.batch(config.BATCH_SIZE)
+    dataset_test = dataset_test.batch(config.BATCH_SIZE)
+
+    return dataset_train, dataset_val, dataset_test

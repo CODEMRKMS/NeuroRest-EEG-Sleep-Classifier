@@ -3,9 +3,13 @@
 import matplotlib.pyplot as plt
 
 
-def train_and_plot(model, dataset_train, dataset_test):
+def train_and_plot(model, dataset_train, dataset_val, dataset_test=None):
     model.summary()
-    history = model.fit(dataset_train, epochs=10, validation_data=dataset_test)
+    history = model.fit(dataset_train, epochs=10, validation_data=dataset_val)
+
+    if dataset_test is not None:
+        test_loss, test_accuracy = model.evaluate(dataset_test)
+        print(f'Held-out test subjects: loss={test_loss:.4f}, accuracy={test_accuracy:.4f}')
 
     plt.plot(history.history['accuracy'])
     plt.plot(history.history['val_accuracy'])

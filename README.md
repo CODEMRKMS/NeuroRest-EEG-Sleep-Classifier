@@ -11,11 +11,14 @@ We are only interested in the EEG data of the PSG.edf file and the label data of
 
 ## Files
 
-- `data.py`: Loads EDF files, maps labels, removes excluded classes, and creates training and testing datasets.
+- `config.py`: Data folder (default `./data/sleep-edf`), subject count, split fractions, seed, and other constants.
+- `data.py`: Downloads the first 20 Sleep-Cassette subjects if the data folder has no EDFs, loads them into 30 s epochs (Fpz-Cz + Pz-Oz, Wake/Movement/`?` removed, 5 classes), caches each recording as `.npz`, and makes a subject-wise 70/10/20 train/val/test split (seed 42) with class counts printed per split.
 - `models.py`: Defines the SimpleNN, SimpleRNN, and 1D CNN architectures.
-- `training.py`: Trains the SimpleNN and creates the accuracy and loss plots.
+- `training.py`: Trains the SimpleNN on train, validates on val, evaluates on the held-out test subjects, and creates the accuracy and loss plots.
 - `run_pipeline.py`: Runs the sections in their original order.
 - `Full file.py`: Compatibility entry point for running the complete pipeline.
+
+Run with `python run_pipeline.py` (options: `--data-dir PATH`, `--num-subjects N`, `--download`). The first run downloads about 2 GB of EDF files into `data/sleep-edf`; later runs read the `.npz` cache in `data/sleep-edf/cache` (delete it to reprocess).
 
 # Code Explanation
 
