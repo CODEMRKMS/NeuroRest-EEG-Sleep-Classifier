@@ -1,0 +1,111 @@
+{
+  "run_name": "v2",
+  "model": "cnn",
+  "architecture": "1D-CNN",
+  "optimizer": "Adam",
+  "learning_rate": 0.001,
+  "final_learning_rate": 0.0001250000059371814,
+  "reduce_lr_on_plateau": {
+    "enabled": true,
+    "monitor": "val_loss",
+    "factor": 0.5,
+    "patience": 2,
+    "min_lr": 1e-06
+  },
+  "loss": "categorical_crossentropy",
+  "batch_size": 128,
+  "max_epochs": 30,
+  "epochs_run": 18,
+  "early_stopping": {
+    "monitor": "val_loss",
+    "patience": 5,
+    "restore_best_weights": true,
+    "stopped_early": true,
+    "early_stop_epoch": 18,
+    "best_epoch": 13
+  },
+  "class_weights": {
+    "S1": 2.2825918762088975,
+    "S2": 0.37101312583510176,
+    "S3": 2.3673019057171514,
+    "S4": 3.4914201183431954,
+    "REM": 0.8637511436413541
+  },
+  "input_shape": [
+    3000,
+    2
+  ],
+  "n_train_epochs": 23602,
+  "n_val_epochs": 3209,
+  "data_fraction": 1.0,
+  "seed": 42,
+  "total_train_time_sec": 1215.7,
+  "tensorflow_version": "2.21.0",
+  "keras_version": "3.15.1",
+  "parameters": 145605,
+  "device": "CPU",
+  "mixed_precision": false,
+  "split": {
+    "train": {
+      "subjects": [
+        "02",
+        "03",
+        "04",
+        "06",
+        "07",
+        "09",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "16",
+        "18",
+        "19"
+      ],
+      "class_counts": {
+        "S1": 2068,
+        "S2": 12723,
+        "S3": 1994,
+        "S4": 1352,
+        "REM": 5465
+      }
+    },
+    "val": {
+      "subjects": [
+        "05",
+        "08"
+      ],
+      "class_counts": {
+        "S1": 265,
+        "S2": 1424,
+        "S3": 464,
+        "S4": 417,
+        "REM": 639
+      }
+    },
+    "test": {
+      "subjects": [
+        "00",
+        "01",
+        "15",
+        "17"
+      ],
+      "class_counts": {
+        "S1": 471,
+        "S2": 3652,
+        "S3": 912,
+        "S4": 564,
+        "REM": 1613
+      }
+    }
+  },
+  "test_labels_md5": "9e5ab0415363e4074ad14c729bab8f50",
+  "normalisation": {
+    "enabled": true,
+    "method": "per-recording, per-channel z-score over the whole night (wake included)",
+    "cache_version": "zscore-v1"
+  },
+  "data_dir": "C:\\Users\\itskm\\Downloads\\NeuroRest-EEG-Sleep-Classifier-main\\NeuroRest-EEG-Sleep-Classifier-main\\data\\sleep-edf",
+  "rnn_downsampling": null
+}
