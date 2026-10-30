@@ -77,8 +77,13 @@ def find_recordings(data_dir):
     return [(key, psg[key], hyp[key]) for key in sorted(psg.keys() & hyp.keys())]
 
 
-def read_recording(psg_path, hyp_path):
-    """Cut one night into 30 s epochs of shape (3000, 2) with sleep-stage labels 0-4."""
+def read_recording(psg_path, hyp_path, normalise=True):
+    """Cut one night into 30 s epochs of shape (3000, 2) with sleep-stage labels 0-4.
+
+    With normalise=True each channel is z-scored with the mean/std of this night alone
+    (whole recording, wake included), so nothing is shared between recordings or subjects.
+    Returns X, y and the per-channel (mean, std) used (None, None if not normalised).
+    """
     f = pyedflib.EdfReader(str(psg_path))
     g = pyedflib.EdfReader(str(hyp_path))
     try:
@@ -87,11 +92,18 @@ def read_recording(psg_path, hyp_path):
         for i in idx:
             if int(round(f.getSampleFrequency(i))) * config.EPOCH_SECONDS != config.SAMPLES_PER_EPOCH:
                 raise ValueError(f'{psg_path.name}: expected 100 Hz EEG')
-        sigbufs = np.stack([f.readSignal(i) for i in idx]).astype(np.float32)
+        sigbufs = np.stack([f.readSignal(i) for i in idx])
         onsets, durations, descriptions = g.readAnnotations()
     finally:
         f.close()
         g.close()
+
+    mean = std = None
+    if normalise:
+        mean = sigbufs.mean(axis=1)
+        std = np.maximum(sigbufs.std(axis=1), 1e-8)
+        sigbufs = (sigbufs - mean[:, None]) / std[:, None]
+    sigbufs = sigbufs.astype(np.float32)
 
     n_samples = sigbufs.shape[1]
     X, y = [], []
@@ -108,23 +120,31 @@ def read_recording(psg_path, hyp_path):
             X.append(np.transpose(sigbufs[:, s:s + config.SAMPLES_PER_EPOCH]))
             y.append(STAGE_TO_CLASS[description])
 
-    return np.stack(X), np.array(y, dtype=np.int8)
+    return np.stack(X), np.array(y, dtype=np.int8), mean, std
 
 
-def cache_recordings(data_dir):
-    """Return [(subject, cache_path)] per recording, reading EDFs only if there is no .npz cache."""
+def cache_recordings(data_dir, normalise=True):
+    """Return [(subject, cache_path)] per recording, reading EDFs only if there is no .npz cache.
+
+    Normalised files are named <id>.<NORM_VERSION>.npz; the un-normalised ones keep <id>.npz,
+    so one kind is never mistaken for the other.
+    """
     data_dir = Path(data_dir)
     cache_dir = data_dir / 'cache'
     cache_dir.mkdir(exist_ok=True)
+    suffix = f'.{config.NORM_VERSION}' if normalise else ''
 
     cached = []
     for key, psg_path, hyp_path in find_recordings(data_dir):
-        cache = cache_dir / f'{key}.npz'
+        cache = cache_dir / f'{key}{suffix}.npz'
         if not cache.exists():
             print(f'Processing {psg_path.name} -> {cache.name}')
-            X, y = read_recording(psg_path, hyp_path)
-            tmp = cache_dir / f'{key}.tmp.npz'
-            np.savez(tmp, X=X, y=y)
+            X, y, mean, std = read_recording(psg_path, hyp_path, normalise)
+            tmp = cache_dir / f'{key}{suffix}.tmp.npz'
+            if normalise:
+                np.savez(tmp, X=X, y=y, mean=mean, std=std)
+            else:
+                np.savez(tmp, X=X, y=y)
             os.replace(tmp, cache)
         cached.append((key[3:5], cache))
     return cached
@@ -158,7 +178,7 @@ def print_split_summary(name, subjects, y):
 # ---------------------------------------------------------------- datasets
 
 def load_splits(data_dir=config.DATA_DIR, num_subjects=config.NUM_SUBJECTS, download=False,
-                with_test_x=True):
+                with_test_x=True, normalise=True):
     """Subject-wise split as {'train'|'val'|'test': {'subjects', 'X', 'y'}}; y holds class ids 0-4.
 
     With with_test_x=False the test signals are never read from the cache (X is None),
@@ -168,7 +188,7 @@ def load_splits(data_dir=config.DATA_DIR, num_subjects=config.NUM_SUBJECTS, down
 
     if download or not find_recordings(data_dir):
         download_sleep_edf(data_dir, num_subjects)
-    cached = cache_recordings(data_dir)
+    cached = cache_recordings(data_dir, normalise)
     if not cached:
         raise FileNotFoundError(f'No PSG/Hypnogram EDF pairs found in {data_dir}')
 

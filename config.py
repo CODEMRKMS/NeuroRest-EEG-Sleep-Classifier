@@ -16,6 +16,10 @@ EPOCH_SECONDS = 30
 SAMPLES_PER_EPOCH = 3000  # 30 s at 100 Hz
 CLASS_NAMES = ('S1', 'S2', 'S3', 'S4', 'REM')
 
+# Per-recording, per-channel z-score. Its tag is part of the normalised cache file names, so
+# bump it whenever the normalisation changes. Un-normalised files keep the plain <id>.npz name.
+NORM_VERSION = 'zscore-v1'
+
 # Subject-wise split (fractions of subjects, not epochs)
 SEED = 42
 VAL_FRACTION = 0.1

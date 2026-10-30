@@ -18,12 +18,13 @@ from tensorflow.keras.utils import to_categorical
 
 import config
 import data
-from models import BUILDERS, LEARNING_RATES
+from models import BUILDERS
 
 MODEL_ORDER = ('cnn', 'mlp', 'rnn')
 MODEL_TITLES = {'mlp': 'MLP (SimpleNN)', 'cnn': '1D-CNN', 'rnn': 'SimpleRNN'}
 DEFAULT_MAX_EPOCHS = {'mlp': 10, 'cnn': 30, 'rnn': 10}
-PATIENCE = 5
+V2_LEARNING_RATES = {'mlp': 1e-3, 'cnn': 1e-3, 'rnn': 1e-4}
+REDUCE_LR = {'monitor': 'val_loss', 'factor': 0.5, 'patience': 2, 'min_lr': 1e-6}
 
 RNN_TIMING_FRACTION = 0.05      # share of the training data used for the timing epoch
 RNN_MAX_EPOCH_SECONDS = 300     # downsample if a projected full epoch is slower than this
@@ -40,6 +41,17 @@ def parse_args(argv=None):
     parser.add_argument('--max-epochs', type=int, default=None,
                         help='default: mlp %(mlp)d, cnn %(cnn)d, rnn %(rnn)d' % DEFAULT_MAX_EPOCHS)
     parser.add_argument('--batch-size', type=int, default=128, help='same for all models (default: %(default)s)')
+    parser.add_argument('--run-name', default='v2',
+                        help='results go to <results-dir>/<run-name>/<model>/ (default: %(default)s)')
+    parser.add_argument('--lr', type=float, default=None,
+                        help='Adam learning rate for every model being trained; default is the v2 value per model '
+                             '(mlp %(mlp)g, cnn %(cnn)g, rnn %(rnn)g)' % V2_LEARNING_RATES)
+    parser.add_argument('--patience', type=int, default=5,
+                        help='EarlyStopping patience on val_loss (default: %(default)s)')
+    parser.add_argument('--no-normalise', action='store_true',
+                        help='use the raw EEG instead of per-recording, per-channel z-scores (v1 behaviour)')
+    parser.add_argument('--no-reduce-lr', action='store_true',
+                        help='disable ReduceLROnPlateau (v1 behaviour)')
     parser.add_argument('--seed', type=int, default=42, help='training seed (default: %(default)s)')
     parser.add_argument('--rnn-downsample', type=int, default=10,
                         help='average-pool factor along time for the RNN input if the full-length RNN is too '
@@ -101,7 +113,7 @@ def take_fraction(X, y, fraction, seed):
 
 # --------------------------------------------------------------------- RNN
 
-def decide_rnn_input(X_train, y_train, X_val, y_val, args):
+def decide_rnn_input(X_train, y_train, X_val, y_val, args, learning_rate):
     """Time one epoch on 5% of the data at full length and decide whether to downsample."""
     length = X_train.shape[1]
     Xs, ys = take_fraction(X_train, y_train, RNN_TIMING_FRACTION, args.seed)
@@ -109,7 +121,7 @@ def decide_rnn_input(X_train, y_train, X_val, y_val, args):
     fraction = len(Xs) / len(X_train)
 
     seed_everything(args.seed)
-    model = BUILDERS['rnn']((length, X_train.shape[2]))
+    model = BUILDERS['rnn']((length, X_train.shape[2]), learning_rate)
     train_ds = make_dataset(Xs, to_categorical(ys, 5), args.batch_size, False, args.seed)
     val_ds = make_dataset(Xv, to_categorical(yv, 5), args.batch_size, False, args.seed)
     model.fit(train_ds.take(1), epochs=1, shuffle=False, verbose=0)  # warm-up: exclude graph tracing from the timing
@@ -173,13 +185,13 @@ def plot_curves(history, out_dir, title):
         plt.close()
 
 
-def train_model(name, X_train, y_train, X_val, y_val, args, run_info, out_dir):
+def train_model(name, X_train, y_train, X_val, y_val, args, learning_rate, run_info, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     seed_everything(args.seed)  # each model starts from the same seed regardless of what ran before it
     max_epochs = args.max_epochs or DEFAULT_MAX_EPOCHS[name]
     input_shape = tuple(X_train.shape[1:])
 
-    model = BUILDERS[name](input_shape)
+    model = BUILDERS[name](input_shape, learning_rate)
     model.summary()
 
     weights = compute_class_weight('balanced', classes=np.arange(len(config.CLASS_NAMES)), y=y_train)
@@ -192,13 +204,16 @@ def train_model(name, X_train, y_train, X_val, y_val, args, run_info, out_dir):
     model_path = out_dir / 'model.keras'
     timer = EpochTimer()
     early_stopping = tf.keras.callbacks.EarlyStopping(
-        monitor='val_loss', patience=PATIENCE, restore_best_weights=True)
-    checkpoint = tf.keras.callbacks.ModelCheckpoint(
-        model_path, monitor='val_loss', save_best_only=True)  # best weights are on disk even if a later epoch crashes
+        monitor='val_loss', patience=args.patience, restore_best_weights=True)
+    callbacks = [timer, early_stopping]
+    if not args.no_reduce_lr:
+        callbacks.append(tf.keras.callbacks.ReduceLROnPlateau(**REDUCE_LR))
+    callbacks.append(tf.keras.callbacks.ModelCheckpoint(
+        model_path, monitor='val_loss', save_best_only=True))  # best weights are on disk even if a later epoch crashes
 
     start = time.perf_counter()
     fit = model.fit(train_ds, validation_data=val_ds, epochs=max_epochs, class_weight=class_weight,
-                    callbacks=[timer, early_stopping, checkpoint], shuffle=False, verbose=2)
+                    callbacks=callbacks, shuffle=False, verbose=2)
     total_time = time.perf_counter() - start
     if not model_path.exists():  # val_loss never improved (e.g. NaN)
         model.save(model_path)
@@ -206,23 +221,29 @@ def train_model(name, X_train, y_train, X_val, y_val, args, run_info, out_dir):
     history = pd.DataFrame(fit.history)
     history.insert(0, 'epoch', np.arange(1, len(history) + 1))
     history['epoch_time_sec'] = np.round(timer.times, 3)
-    history = history[['epoch', 'loss', 'accuracy', 'val_loss', 'val_accuracy', 'epoch_time_sec']]
+    columns = ['epoch', 'loss', 'accuracy', 'val_loss', 'val_accuracy', 'epoch_time_sec']
+    if 'learning_rate' in history:  # logged by ReduceLROnPlateau
+        columns.append('learning_rate')
+    history = history[columns]
     history.to_csv(out_dir / 'history.csv', index=False)
     plot_curves(history, out_dir, MODEL_TITLES[name])
 
     stopped_early = early_stopping.stopped_epoch > 0
     best_epoch = int(history['val_loss'].idxmin()) + 1
-    learning_rate = LEARNING_RATES[name]
     run_config = {
+        'run_name': args.run_name,
         'model': name,
         'architecture': MODEL_TITLES[name],
         'optimizer': 'Adam',
-        'learning_rate': learning_rate if learning_rate is not None else 'Adam default (0.001)',
+        'learning_rate': learning_rate,
+        'final_learning_rate': float(history['learning_rate'].iloc[-1]) if 'learning_rate' in history
+                               else learning_rate,
+        'reduce_lr_on_plateau': {'enabled': not args.no_reduce_lr, **REDUCE_LR},
         'loss': 'categorical_crossentropy',
         'batch_size': args.batch_size,
         'max_epochs': max_epochs,
         'epochs_run': len(history),
-        'early_stopping': {'monitor': 'val_loss', 'patience': PATIENCE, 'restore_best_weights': True,
+        'early_stopping': {'monitor': 'val_loss', 'patience': args.patience, 'restore_best_weights': True,
                            'stopped_early': stopped_early,
                            'early_stop_epoch': early_stopping.stopped_epoch + 1 if stopped_early else None,
                            'best_epoch': best_epoch},
@@ -249,14 +270,15 @@ def train_model(name, X_train, y_train, X_val, y_val, args, run_info, out_dir):
 
 
 def run_model(name, splits, args, run_info):
-    out_dir = args.results_dir / name
+    out_dir = args.results_dir / args.run_name / name
+    learning_rate = args.lr if args.lr is not None else V2_LEARNING_RATES[name]
     X_train, y_train = splits['train']['X'], splits['train']['y']
     X_val, y_val = splits['val']['X'], splits['val']['y']
     info = dict(run_info)
 
     if name == 'rnn':
         out_dir.mkdir(parents=True, exist_ok=True)
-        decision = decide_rnn_input(X_train, y_train, X_val, y_val, args)
+        decision = decide_rnn_input(X_train, y_train, X_val, y_val, args, learning_rate)
         info['rnn_downsampling'] = decision
         with open(out_dir / 'run_config.json', 'w') as f:  # kept even if training later fails
             json.dump({'model': name, 'status': 'input decision only', **info}, f, indent=2)
@@ -266,7 +288,7 @@ def run_model(name, splits, args, run_info):
     else:
         info['rnn_downsampling'] = None
 
-    return train_model(name, X_train, y_train, X_val, y_val, args, info, out_dir)
+    return train_model(name, X_train, y_train, X_val, y_val, args, learning_rate, info, out_dir)
 
 
 # -------------------------------------------------------------------- main
@@ -277,7 +299,7 @@ def main(argv=None):
     device = setup_device()
 
     # The test signals are never loaded here; only its labels, for the split check below.
-    splits = data.load_splits(args.data_dir, with_test_x=False)
+    splits = data.load_splits(args.data_dir, with_test_x=False, normalise=not args.no_normalise)
     for name in ('train', 'val', 'test'):
         data.print_split_summary(name, splits[name]['subjects'], splits[name]['y'])
     test_md5 = hashlib.md5(splits['test']['y'].astype(np.int8).tobytes()).hexdigest()
@@ -297,6 +319,11 @@ def main(argv=None):
                                                   np.bincount(splits[name]['y'], minlength=5).tolist()))}
                   for name in ('train', 'val', 'test')},
         'test_labels_md5': test_md5,
+        'normalisation': {'enabled': not args.no_normalise,
+                          'method': 'per-recording, per-channel z-score over the whole night (wake included)'
+                                    if not args.no_normalise else None,
+                          'cache_version': config.NORM_VERSION if not args.no_normalise else 'raw'},
+        'data_dir': str(args.data_dir),
     }
 
     names = MODEL_ORDER if args.model == 'all' else (args.model,)
